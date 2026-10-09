@@ -1,9 +1,14 @@
 
+import os
+
 from fastapi.testclient import TestClient
 from app.main import app
 
 
 client = TestClient(app)
+TEST_API_KEY = "test-secret"
+os.environ["SYLVASEARCH_API_KEY"] = TEST_API_KEY
+AUTH_HEADERS = {"X-API-Key": TEST_API_KEY}
 
 
 def test_health_endpoint():
@@ -14,7 +19,7 @@ def test_health_endpoint():
 
 
 def test_debug_index_endpoint():
-    response = client.get("/debug/index")
+    response = client.get("/debug/index", headers=AUTH_HEADERS)
 
     assert response.status_code == 200
 
@@ -25,7 +30,7 @@ def test_debug_index_endpoint():
 
 
 def test_debug_corpus_endpoint():
-    response = client.get("/debug/corpus")
+    response = client.get("/debug/corpus", headers=AUTH_HEADERS)
 
     assert response.status_code == 200
 

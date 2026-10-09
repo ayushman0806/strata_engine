@@ -27,9 +27,6 @@ from app.search.pagerank import PageRank
 from app.database import get_documents_by_urls
 
 
-MAX_SEEDS_PER_REQUEST = 20
-
-
 app = FastAPI(
     title="SylvaSearch",
     description="My own search engine",
@@ -316,7 +313,7 @@ def crawl(url: str):
 
 @app.get("/crawl-seeds", dependencies=[Depends(require_api_key)])
 def crawl_seeds(
-    seeds: str = Query(min_length=1, max_length=5000),
+    seeds: str,
     max_pages: int = Query(default=100, ge=1, le=500),
 ):
     """
@@ -324,12 +321,6 @@ def crawl_seeds(
     max_pages applies per seed/domain, not to the combined crawl.
     """
     seed_urls = [seed.strip() for seed in seeds.split(",") if seed.strip()]
-    if len(seed_urls) > MAX_SEEDS_PER_REQUEST:
-        raise HTTPException(
-            status_code=400,
-            detail=f"At most {MAX_SEEDS_PER_REQUEST} seed URLs are allowed per request.",
-        )
-
     if not seed_urls:
         raise HTTPException(
             status_code=400,
@@ -396,7 +387,7 @@ def frontier_stats():
 
 @app.post("/crawl-queue", dependencies=[Depends(require_api_key)])
 def crawl_queue(
-    seeds: str = Query(min_length=1, max_length=5000),
+    seeds: str,
     max_pages: int = Query(default=10, ge=1, le=100),
     max_depth: int = Query(default=2, ge=0, le=5),
     delay: float = Query(default=1.0, ge=0, le=5),
@@ -405,12 +396,6 @@ def crawl_queue(
     seed_urls = list(dict.fromkeys(
         item.strip() for item in seeds.split(",") if item.strip()
     ))
-
-    if len(seed_urls) > MAX_SEEDS_PER_REQUEST:
-        raise HTTPException(
-            status_code=400,
-            detail=f"At most {MAX_SEEDS_PER_REQUEST} seed URLs are allowed per request.",
-        )
 
     if not seed_urls:
         raise HTTPException(
@@ -590,7 +575,7 @@ def calculate_pagerank():
     }
 
 
-@app.get("/graph", dependencies=[Depends(require_api_key)])
+@app.get("/graph")
 def graph():
     connection = get_connection()
     try:

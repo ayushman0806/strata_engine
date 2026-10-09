@@ -75,6 +75,26 @@ def initialize_database():
 
         connection.execute("CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_url)")
 
+        # Recover interrupted crawl jobs on startup.
+        connection.execute("""
+            UPDATE crawl_frontier
+            SET status = 'pending',
+                updated_at = CURRENT_TIMESTAMP,
+                next_attempt_at = NULL,
+                last_error = 'Recovered after interrupted crawl'
+            WHERE status = 'processing'
+              AND attempts < 3
+        """)
+
+        connection.execute("""
+            UPDATE crawl_frontier
+            SET status = 'failed',
+                updated_at = CURRENT_TIMESTAMP,
+                last_error = 'Interrupted crawl; retry limit exhausted'
+            WHERE status = 'processing'
+              AND attempts >= 3
+        """)
+
         connection.commit()
 
     except Exception:

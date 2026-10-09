@@ -4,57 +4,6 @@ from urllib.parse import urljoin, urlparse, urldefrag
 from urllib.robotparser import RobotFileParser
 
 import requests
-
-import ipaddress
-import socket
-from urllib.parse import urlsplit
-
-
-def validate_outbound_url(url):
-    """Reject unsafe HTTP destinations immediately before connecting."""
-    try:
-        parsed = urlsplit(url)
-        if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
-            raise ValueError("Only HTTP(S) destinations are allowed.")
-
-        if parsed.username is not None or parsed.password is not None:
-            raise ValueError("URL credentials are not allowed.")
-
-        host = parsed.hostname.rstrip(".")
-        if host.lower() == "localhost" or host.lower().endswith(".localhost"):
-            raise ValueError("Localhost destinations are blocked.")
-
-        try:
-            addresses = [ipaddress.ip_address(host)]
-        except ValueError:
-            port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
-            answers = socket.getaddrinfo(
-                host, port, type=socket.SOCK_STREAM
-            )
-            addresses = [
-                ipaddress.ip_address(answer[4][0])
-                for answer in answers
-            ]
-
-        if not addresses or any(not address.is_global for address in addresses):
-            raise ValueError("Non-public destination addresses are blocked.")
-
-    except requests.exceptions.RequestException:
-        raise
-    except (ValueError, UnicodeError, OSError) as exc:
-        raise requests.exceptions.InvalidURL(
-            f"Unsafe outbound URL: {exc}"
-        ) from exc
-
-
-class SafeSession(requests.Session):
-    """Validate every connection, including requests followed via redirects."""
-
-    def send(self, request, **kwargs):
-        validate_outbound_url(request.url)
-        return super().send(request, **kwargs)
-
-
 from bs4 import BeautifulSoup
 from app.crawler.politeness import wait_for_host
 
@@ -82,7 +31,7 @@ class Crawler:
         self.queue = deque()
         self.robot_parsers = {}
 
-        self.session = SafeSession()
+        self.session = requests.Session()
         self.session.headers.update(
             {
                 "User-Agent": "SylvaSearchBot/0.1",

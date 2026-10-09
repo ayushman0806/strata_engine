@@ -590,7 +590,7 @@ def calculate_pagerank():
     }
 
 
-@app.get("/graph", dependencies=[Depends(require_api_key)])
+@app.get("/graph")
 def graph():
     connection = get_connection()
     try:

@@ -27,9 +27,6 @@ from app.search.pagerank import PageRank
 from app.database import get_documents_by_urls
 
 
-MAX_SEEDS_PER_REQUEST = 20
-
-
 app = FastAPI(
     title="SylvaSearch",
     description="My own search engine",
@@ -125,47 +122,14 @@ def rebuild_search_state(documents=None):
 
 
 def validate_http_url(url: str) -> str:
-    """Validate a public HTTP(S) seed URL and return its hostname."""
-    import ipaddress
-    import socket
-
-    if not isinstance(url, str) or not url.strip():
-        raise HTTPException(status_code=400, detail="A URL is required.")
-
-    try:
-        parsed = urlparse(url.strip())
-        if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
-            raise ValueError("Only HTTP(S) URLs are allowed.")
-
-        if parsed.username is not None or parsed.password is not None:
-            raise ValueError("URLs containing credentials are not allowed.")
-
-        hostname = parsed.hostname.rstrip(".")
-        if hostname.lower() == "localhost" or hostname.lower().endswith(".localhost"):
-            raise ValueError("Localhost destinations are not allowed.")
-
-        try:
-            addresses = [ipaddress.ip_address(hostname)]
-        except ValueError:
-            # Resolve DNS and reject the host if ANY resolved address is non-public.
-            addresses = [
-                ipaddress.ip_address(item[4][0])
-                for item in socket.getaddrinfo(
-                    hostname, parsed.port or (443 if parsed.scheme.lower() == "https" else 80),
-                    type=socket.SOCK_STREAM,
-                )
-            ]
-
-        if not addresses or any(not address.is_global for address in addresses):
-            raise ValueError("Private or non-public network destinations are not allowed.")
-
-        return hostname
-
-    except (ValueError, UnicodeError, OSError, socket.gaierror) as exc:
+    """Validate a seed URL and return its netloc."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid or unsafe URL: {exc}",
-        ) from exc
+            detail=f"Invalid URL: {url}. Use an http:// or https:// URL.",
+        )
+    return parsed.netloc
 
 
 def save_crawled_documents(documents):
@@ -316,7 +280,7 @@ def crawl(url: str):
 
 @app.get("/crawl-seeds", dependencies=[Depends(require_api_key)])
 def crawl_seeds(
-    seeds: str = Query(min_length=1, max_length=5000),
+    seeds: str,
     max_pages: int = Query(default=100, ge=1, le=500),
 ):
     """
@@ -324,12 +288,6 @@ def crawl_seeds(
     max_pages applies per seed/domain, not to the combined crawl.
     """
     seed_urls = [seed.strip() for seed in seeds.split(",") if seed.strip()]
-    if len(seed_urls) > MAX_SEEDS_PER_REQUEST:
-        raise HTTPException(
-            status_code=400,
-            detail=f"At most {MAX_SEEDS_PER_REQUEST} seed URLs are allowed per request.",
-        )
-
     if not seed_urls:
         raise HTTPException(
             status_code=400,
@@ -396,7 +354,7 @@ def frontier_stats():
 
 @app.post("/crawl-queue", dependencies=[Depends(require_api_key)])
 def crawl_queue(
-    seeds: str = Query(min_length=1, max_length=5000),
+    seeds: str,
     max_pages: int = Query(default=10, ge=1, le=100),
     max_depth: int = Query(default=2, ge=0, le=5),
     delay: float = Query(default=1.0, ge=0, le=5),
@@ -405,12 +363,6 @@ def crawl_queue(
     seed_urls = list(dict.fromkeys(
         item.strip() for item in seeds.split(",") if item.strip()
     ))
-
-    if len(seed_urls) > MAX_SEEDS_PER_REQUEST:
-        raise HTTPException(
-            status_code=400,
-            detail=f"At most {MAX_SEEDS_PER_REQUEST} seed URLs are allowed per request.",
-        )
 
     if not seed_urls:
         raise HTTPException(
@@ -590,7 +542,7 @@ def calculate_pagerank():
     }
 
 
-@app.get("/graph", dependencies=[Depends(require_api_key)])
+@app.get("/graph")
 def graph():
     connection = get_connection()
     try:

@@ -1,0 +1,95 @@
+[
+  {
+    "query": "python downloads",
+    "relevant_ids": [
+      47,
+      39,
+      6,
+      12,
+      13,
+      36,
+      121,
+      27
+    ]
+  },
+  {
+    "query": "python documentation",
+    "relevant_ids": [
+      5,
+      68,
+      24,
+      34,
+      38
+    ]
+  },
+  {
+    "query": "python beginner getting started",
+    "relevant_ids": [
+      34,
+      1,
+      33,
+      78,
+      86
+    ]
+  },
+  {
+    "query": "python events conferences",
+    "relevant_ids": [
+      3,
+      16,
+      11,
+      21,
+      22,
+      26,
+      32,
+      41,
+      45,
+      18
+    ]
+  },
+  {
+    "query": "python community forums",
+    "relevant_ids": [
+      29,
+      8,
+      10,
+      18,
+      20,
+      42,
+      44,
+      58,
+      101
+    ]
+  },
+  {
+    "query": "machine learning python scikit learn",
+    "relevant_ids": [
+      141,
+      142,
+      143,
+      147,
+      148,
+      149,
+      144,
+      145,
+      146
+    ]
+  },
+  {
+    "query": "javascript operators expressions",
+    "relevant_ids": [
+      72
+    ]
+  },
+  {
+    "query": "CSS reference styling colors",
+    "relevant_ids": [
+      82,
+      85,
+      76,
+      77,
+      81,
+      74
+    ]
+  }
+]

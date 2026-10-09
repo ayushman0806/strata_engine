@@ -1,0 +1,1791 @@
+﻿
+================================================================================
+FILE: D:\SE\sylvasearch\backend\app\database.py
+================================================================================
+
+import sqlite3
+from pathlib import Path
+
+
+# backend/app/database.py -> backend/data/sylvasearch.db
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+DATABASE = DATA_DIR / "sylvasearch.db"
+
+
+def get_connection():
+    connection = sqlite3.connect(DATABASE, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout = 30000")
+    return connection
+
+
+def initialize_database():
+    """Create missing tables without deleting existing data."""
+    connection = get_connection()
+
+    try:
+        connection.execute("PRAGMA journal_mode = WAL")
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT UNIQUE NOT NULL,
+                title TEXT,
+                content TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_url TEXT NOT NULL,
+                target_url TEXT NOT NULL,
+                UNIQUE(source_url, target_url)
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS crawl_frontier (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT NOT NULL UNIQUE,
+                source_url TEXT,
+                depth INTEGER NOT NULL DEFAULT 0,
+                priority INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN (
+                        'pending', 'processing', 'crawled', 'failed'
+                    )),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                next_attempt_at TIMESTAMP,
+                last_error TEXT
+            )
+        """)
+
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_frontier_status_priority
+            ON crawl_frontier(status, priority DESC, id ASC)
+        """)
+
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_frontier_retry
+            ON crawl_frontier(status, next_attempt_at)
+        """)
+
+        connection.commit()
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()
+
+
+def get_all_documents():
+    connection = get_connection()
+
+    try:
+        return connection.execute("""
+            SELECT id, url, title, content
+            FROM documents
+        """).fetchall()
+    finally:
+        connection.close()
+
+
+def enqueue_url(url, source_url=None, depth=0, priority=0):
+    """Add a URL once. Existing queue entries are left unchanged."""
+    if not url or not url.startswith(("http://", "https://")):
+        raise ValueError("URL must start with http:// or https://")
+
+    if depth < 0:
+        raise ValueError("Depth cannot be negative")
+
+    connection = get_connection()
+
+    try:
+        cursor = connection.execute("""
+            INSERT OR IGNORE INTO crawl_frontier
+                (url, source_url, depth, priority)
+            VALUES (?, ?, ?, ?)
+        """, (url, source_url, depth, priority))
+
+        connection.commit()
+        return cursor.rowcount == 1
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()
+
+
+def enqueue_urls(urls):
+    """Add multiple URL records; each item is a dictionary."""
+    added = 0
+
+    for item in urls:
+        if enqueue_url(
+            url=item["url"],
+            source_url=item.get("source_url"),
+            depth=item.get("depth", 0),
+            priority=item.get("priority", 0),
+        ):
+            added += 1
+
+    return added
+
+
+def claim_next_url(max_attempts=3):
+    """Atomically claim the next eligible URL for a crawler worker."""
+    connection = get_connection()
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+
+        row = connection.execute("""
+            SELECT id, url, source_url, depth, priority, attempts
+            FROM crawl_frontier
+            WHERE status = 'pending'
+              AND attempts < ?
+              AND (
+                  next_attempt_at IS NULL
+                  OR next_attempt_at <= CURRENT_TIMESTAMP
+              )
+            ORDER BY priority DESC, id ASC
+            LIMIT 1
+        """, (max_attempts,)).fetchone()
+
+        if row is None:
+            connection.commit()
+            return None
+
+        cursor = connection.execute("""
+            UPDATE crawl_frontier
+            SET status = 'processing',
+                attempts = attempts + 1,
+                updated_at = CURRENT_TIMESTAMP,
+                last_error = NULL
+            WHERE id = ? AND status = 'pending'
+        """, (row["id"],))
+
+        if cursor.rowcount != 1:
+            connection.rollback()
+            return None
+
+        claimed = dict(row)
+        claimed["attempts"] += 1
+
+        connection.commit()
+        return claimed
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()
+
+
+def mark_url_crawled(url):
+    connection = get_connection()
+
+    try:
+        cursor = connection.execute("""
+            UPDATE crawl_frontier
+            SET status = 'crawled',
+                updated_at = CURRENT_TIMESTAMP,
+                next_attempt_at = NULL,
+                last_error = NULL
+            WHERE url = ? AND status = 'processing'
+        """, (url,))
+
+        connection.commit()
+        return cursor.rowcount == 1
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()
+
+
+def mark_url_failed(
+    url,
+    error,
+    max_attempts=3,
+    retry_delay_seconds=60,
+):
+    """Schedule a retry, or permanently fail after max_attempts."""
+    connection = get_connection()
+
+    try:
+        row = connection.execute("""
+            SELECT attempts
+            FROM crawl_frontier
+            WHERE url = ? AND status = 'processing'
+        """, (url,)).fetchone()
+
+        if row is None:
+            return False
+
+        attempts = row["attempts"]
+        exhausted = attempts >= max_attempts
+
+        if exhausted:
+            connection.execute("""
+                UPDATE crawl_frontier
+                SET status = 'failed',
+                    updated_at = CURRENT_TIMESTAMP,
+                    next_attempt_at = NULL,
+                    last_error = ?
+                WHERE url = ? AND status = 'processing'
+            """, (str(error)[:2000], url))
+        else:
+            connection.execute("""
+                UPDATE crawl_frontier
+                SET status = 'pending',
+                    updated_at = CURRENT_TIMESTAMP,
+                    next_attempt_at = datetime(
+                        'now', '+' || ? || ' seconds'
+                    ),
+                    last_error = ?
+                WHERE url = ? AND status = 'processing'
+            """, (
+                max(0, retry_delay_seconds),
+                str(error)[:2000],
+                url,
+            ))
+
+        connection.commit()
+        return True
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()
+
+
+def get_frontier_stats():
+    """Return counts for every queue status."""
+    connection = get_connection()
+
+    try:
+        rows = connection.execute("""
+            SELECT status, COUNT(*) AS count
+            FROM crawl_frontier
+            GROUP BY status
+        """).fetchall()
+
+        stats = {
+            "pending": 0,
+            "processing": 0,
+            "crawled": 0,
+            "failed": 0,
+        }
+
+        for row in rows:
+            stats[row["status"]] = row["count"]
+
+        stats["total"] = sum(stats.values())
+        return stats
+
+    finally:
+        connection.close()
+
+
+
+================================================================================
+FILE: D:\SE\sylvasearch\backend\app\main.py
+================================================================================
+import time
+import xml.etree.ElementTree as ET
+from urllib.parse import urlparse, urldefrag
+
+import requests
+from fastapi import FastAPI, HTTPException, Query
+
+from app.crawler.crawler import Crawler
+
+from app.database import (
+    get_all_documents,
+    get_connection,
+    initialize_database,
+    enqueue_url,
+    claim_next_url,
+    mark_url_crawled,
+    mark_url_failed,
+    get_frontier_stats,
+)
+
+from app.indexer.index import InvertedIndex
+from app.search.engine import SearchEngine
+from app.search.pagerank import PageRank
+
+
+app = FastAPI(
+    title="SylvaSearch",
+    description="My own search engine",
+    version="0.3.0",
+)
+
+initialize_database()
+
+index = InvertedIndex()
+pagerank = PageRank()
+search_engine = SearchEngine(index, {})
+
+
+def load_page_ranks():
+    """Calculate PageRank from links persisted in SQLite."""
+    connection = get_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute("SELECT source_url, target_url FROM links")
+        rows = cursor.fetchall()
+    finally:
+        connection.close()
+
+    links = [(row["source_url"], row["target_url"]) for row in rows]
+    return pagerank.calculate(links)
+
+
+def load_index():
+    """Rebuild the in-memory index from persisted documents."""
+    index.documents.clear()
+    index.index.clear()
+
+    for document in get_all_documents():
+        index.add_document(
+            document["id"],
+            {
+                "url": document["url"],
+                "title": document["title"] or "",
+                "text": document["content"] or "",
+            },
+        )
+
+
+def rebuild_search_state():
+    """Refresh the index and PageRank after data is persisted."""
+    load_index()
+    search_engine.page_ranks = load_page_ranks()
+
+
+def validate_http_url(url: str) -> str:
+    """Validate a seed URL and return its netloc."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid URL: {url}. Use an http:// or https:// URL.",
+        )
+    return parsed.netloc
+
+
+def save_crawled_documents(documents):
+    """Persist documents and their outgoing links to SQLite."""
+    connection = get_connection()
+    new_documents = 0
+    new_links = 0
+
+    try:
+        cursor = connection.cursor()
+
+        for document in documents:
+            cursor.execute(
+                """
+                INSERT OR IGNORE INTO documents (url, title, content)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    document["url"],
+                    document.get("title", ""),
+                    document.get("text", ""),
+                ),
+            )
+            if cursor.rowcount > 0:
+                new_documents += 1
+
+            for target_url in document.get("links", []):
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO links (source_url, target_url)
+                    VALUES (?, ?)
+                    """,
+                    (document["url"], target_url),
+                )
+                if cursor.rowcount > 0:
+                    new_links += 1
+
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+    return new_documents, new_links
+
+
+# Restore the persistent corpus whenever the application starts.
+rebuild_search_state()
+
+
+@app.get("/")
+def home():
+    return {
+        "message": "SylvaSearch is running!",
+        "indexed_documents": len(index.documents),
+    }
+
+
+@app.get("/crawl")
+def crawl(url: str):
+    """Crawl one domain, save its pages, and refresh the search index."""
+    domain = validate_http_url(url)
+    crawler = Crawler(
+        max_pages=50,
+        allowed_domain=domain,
+        max_depth=2,
+        delay=1.0,
+    )
+
+    try:
+        crawl_result = crawler.crawl(url)
+    finally:
+        crawler.close()
+
+    documents = crawl_result.get("documents", [])
+    new_documents, new_links = save_crawled_documents(documents)
+    rebuild_search_state()
+
+    return {
+        "seed": url,
+        "pages_crawled": len(documents),
+        "new_documents": new_documents,
+        "new_links": new_links,
+        "links_found": sum(len(doc.get("links", [])) for doc in documents),
+        "blocked_by_robots": crawl_result.get("blocked_by_robots", 0),
+        "request_errors": crawl_result.get("request_errors", 0),
+        "total_indexed_documents": len(index.documents),
+    }
+
+
+@app.get("/crawl-seeds")
+def crawl_seeds(
+    seeds: str,
+    max_pages: int = Query(default=100, ge=1, le=500),
+):
+    """
+    Crawl multiple domains and persist the collected pages.
+    max_pages applies per seed/domain, not to the combined crawl.
+    """
+    seed_urls = [seed.strip() for seed in seeds.split(",") if seed.strip()]
+    if not seed_urls:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one seed URL is required.",
+        )
+
+    validated_seeds = [
+        (seed_url, validate_http_url(seed_url))
+        for seed_url in seed_urls
+    ]
+
+    all_documents = []
+    seen_urls = set()
+    blocked_by_robots = 0
+    request_errors = 0
+
+    for seed_url, domain in validated_seeds:
+        print(f"Starting seed: {seed_url}")
+        crawler = Crawler(
+            max_pages=max_pages,
+            allowed_domain=domain,
+            max_depth=2,
+            delay=1.0,
+        )
+
+        try:
+            crawl_result = crawler.crawl(seed_url)
+        finally:
+            crawler.close()
+
+        blocked_by_robots += crawl_result.get("blocked_by_robots", 0)
+        request_errors += crawl_result.get("request_errors", 0)
+
+        for document in crawl_result.get("documents", []):
+            document_url = document.get("url")
+            if not document_url or document_url in seen_urls:
+                continue
+            seen_urls.add(document_url)
+            all_documents.append(document)
+
+    # This work must happen before returning the response.
+    new_documents, new_links = save_crawled_documents(all_documents)
+    rebuild_search_state()
+
+    return {
+        "seeds": [seed_url for seed_url, _ in validated_seeds],
+        "pages_crawled": len(all_documents),
+        "new_documents": new_documents,
+        "new_links": new_links,
+        "links_found": sum(
+            len(document.get("links", [])) for document in all_documents
+        ),
+        "blocked_by_robots": blocked_by_robots,
+        "request_errors": request_errors,
+        "total_indexed_documents": len(index.documents),
+    }
+
+
+@app.get("/frontier/stats")
+def frontier_stats():
+    """Return persistent crawl queue statistics."""
+    return get_frontier_stats()
+
+
+@app.post("/crawl-queue")
+def crawl_queue(
+    seeds: str,
+    max_pages: int = Query(default=10, ge=1, le=100),
+    max_depth: int = Query(default=2, ge=0, le=5),
+    delay: float = Query(default=1.0, ge=0, le=5),
+):
+    """Enqueue seed URLs and process a bounded batch of pages."""
+    seed_urls = list(dict.fromkeys(
+        item.strip() for item in seeds.split(",") if item.strip()
+    ))
+
+    if not seed_urls:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide at least one seed URL.",
+        )
+
+    validated_seeds = []
+
+    for seed in seed_urls:
+        domain = validate_http_url(seed)
+
+        crawler = Crawler(
+            max_pages=1,
+            allowed_domain=domain,
+            max_depth=0,
+            delay=0,
+        )
+        try:
+            normalized = crawler.normalize_url(seed)
+        finally:
+            crawler.close()
+
+        if not normalized:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid seed URL: {seed}",
+            )
+
+        validated_seeds.append((normalized, domain))
+
+    seeds_added = 0
+
+    for seed_url, _domain in validated_seeds:
+        if enqueue_url(seed_url, depth=0, priority=100):
+            seeds_added += 1
+
+    pages_processed = 0
+    new_documents = 0
+    new_links = 0
+    blocked_by_robots = 0
+    request_errors = 0
+
+    while pages_processed < max_pages:
+        job = claim_next_url(max_attempts=3)
+
+        if job is None:
+            break
+
+        url = job["url"]
+        depth = job["depth"]
+        domain = validate_http_url(url)
+
+        crawler = Crawler(
+            max_pages=1,
+            allowed_domain=domain,
+            max_depth=0,
+            delay=0,
+        )
+
+        try:
+            result = crawler.crawl(url)
+        except Exception as exc:
+            mark_url_failed(
+                url,
+                str(exc),
+                max_attempts=3,
+                retry_delay_seconds=60,
+            )
+            pages_processed += 1
+            continue
+        finally:
+            crawler.close()
+
+        blocked_by_robots += result.get("blocked_by_robots", 0)
+        request_errors += result.get("request_errors", 0)
+        documents = result.get("documents", [])
+
+        if not documents:
+            mark_url_failed(
+                url,
+                "No indexable page returned by crawler",
+                max_attempts=3,
+                retry_delay_seconds=60,
+            )
+            pages_processed += 1
+            continue
+
+        try:
+            added_docs, added_links = save_crawled_documents(documents)
+            
+            new_documents += added_docs
+            new_links += added_links
+
+            if depth < max_depth:
+                for document in documents:
+                    for link in document.get("links", []):
+                        enqueue_url(
+                            link,
+                            source_url=document["url"],
+                            depth=depth + 1,
+                            priority=10,
+                        )
+
+            mark_url_crawled(url)
+
+        except Exception as exc:
+            mark_url_failed(
+                url,
+                str(exc),
+                max_attempts=3,
+                retry_delay_seconds=60,
+            )
+            pages_processed += 1
+            continue
+
+        pages_processed += 1
+
+        if delay and pages_processed < max_pages:
+            time.sleep(delay)
+
+    rebuild_search_state()
+
+    return {
+        "seeds_added": seeds_added,
+        "pages_processed": pages_processed,
+        "new_documents": new_documents,
+        "new_links": new_links,
+        "blocked_by_robots": blocked_by_robots,
+        "request_errors": request_errors,
+        "indexed_documents": len(index.documents),
+        "frontier": get_frontier_stats(),
+    }
+
+
+@app.get("/search")
+def search(q: str = Query(min_length=1, max_length=300)):
+    if not q.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Search query cannot be empty.",
+        )
+
+    results = search_engine.search(q)
+    return {"query": q, "total_results": len(results), "results": results}
+
+
+@app.get("/pagerank")
+def calculate_pagerank():
+    ranks = load_page_ranks()
+    sorted_ranks = sorted(ranks.items(), key=lambda item: item[1], reverse=True)
+    return {
+        "total_pages": len(ranks),
+        "pages": [
+            {"url": url, "pagerank": round(score, 8)}
+            for url, score in sorted_ranks[:20]
+        ],
+    }
+
+
+@app.get("/graph")
+def graph():
+    connection = get_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            "SELECT source_url, target_url FROM links LIMIT 100"
+        )
+        rows = cursor.fetchall()
+    finally:
+        connection.close()
+
+    return {
+        "total_links": len(rows),
+        "links": [
+            {"source": row["source_url"], "target": row["target_url"]}
+            for row in rows
+        ],
+    }
+
+
+@app.get("/debug/index")
+def debug_index():
+    return {
+        "total_documents": len(index.documents),
+        "total_terms": len(index.index),
+        "has_artificial": "artificial" in index.index,
+        "artificial_documents": len(index.index.get("artificial", set())),
+        "has_intelligence": "intelligence" in index.index,
+        "intelligence_documents": len(index.index.get("intelligence", set())),
+        "has_machine": "machine" in index.index,
+        "machine_documents": len(index.index.get("machine", set())),
+        "has_learning": "learning" in index.index,
+        "learning_documents": len(index.index.get("learning", set())),
+    }
+
+
+@app.get("/debug/document")
+def debug_document(url: str):
+    connection = get_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT id, url, title, content
+            FROM documents
+            WHERE url = ?
+            """,
+            (url,),
+        )
+        row = cursor.fetchone()
+    finally:
+        connection.close()
+
+    if row is None:
+        return {"found": False, "message": "Document not found"}
+
+    content = row["content"] or ""
+    return {
+        "found": True,
+        "id": row["id"],
+        "url": row["url"],
+        "title": row["title"],
+        "content_length": len(content),
+        "content_preview": content[:5000],
+    }
+
+
+@app.get("/debug/documents")
+def debug_documents():
+    connection = get_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute("SELECT id, url, title FROM documents ORDER BY id")
+        rows = cursor.fetchall()
+    finally:
+        connection.close()
+
+    return {
+        "total": len(rows),
+        "documents": [
+            {"id": row["id"], "url": row["url"], "title": row["title"]}
+            for row in rows
+        ],
+    }
+
+
+@app.get("/debug/term")
+def debug_term(term: str = Query(min_length=1, max_length=200)):
+    connection = get_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT id, url, title, content
+            FROM documents
+            WHERE LOWER(content) LIKE ?
+            LIMIT 10
+            """,
+            (f"%{term.lower()}%",),
+        )
+        rows = cursor.fetchall()
+    finally:
+        connection.close()
+
+    return {
+        "term": term,
+        "matches": len(rows),
+        "documents": [
+            {
+                "id": row["id"],
+                "url": row["url"],
+                "title": row["title"],
+                "content_preview": (row["content"] or "")[:1000],
+            }
+            for row in rows
+        ],
+    }
+
+
+@app.get("/debug/corpus")
+def debug_corpus():
+    connection = get_connection()
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT url, title, LENGTH(content) AS content_length
+            FROM documents
+            ORDER BY id
+            """
+        )
+        rows = cursor.fetchall()
+    finally:
+        connection.close()
+
+    return {
+        "total_documents": len(rows),
+        "documents": [
+            {
+                "url": row["url"],
+                "title": row["title"],
+                "content_length": row["content_length"],
+            }
+            for row in rows
+        ],
+    }
+
+
+================================================================================
+FILE: D:\SE\sylvasearch\backend\app\__init__.py
+================================================================================
+
+================================================================================
+FILE: D:\SE\sylvasearch\backend\app\crawler\crawler.py
+================================================================================
+import time
+from collections import deque
+from urllib.parse import urljoin, urlparse, urldefrag
+from urllib.robotparser import RobotFileParser
+
+import requests
+from bs4 import BeautifulSoup
+
+
+class Crawler:
+    """A polite, domain-restricted breadth-first web crawler."""
+
+    def __init__(
+        self,
+        max_pages=20,
+        allowed_domain=None,
+        max_depth=2,
+        delay=1.0,
+    ):
+        self.max_pages = max(1, int(max_pages))
+        self.allowed_domain = (
+            allowed_domain.lower().strip()
+            if allowed_domain
+            else None
+        )
+        self.max_depth = max(0, int(max_depth))
+        self.delay = max(0.0, float(delay))
+
+        self.visited = set()
+        self.queue = deque()
+        self.robot_parsers = {}
+
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": "SylvaSearchBot/0.1",
+                "Accept": "text/html,application/xhtml+xml",
+            }
+        )
+
+    # ---------------------------------------------------------
+    # URL NORMALIZATION
+    # ---------------------------------------------------------
+
+    def normalize_url(self, url):
+        """Normalize HTTP(S) URLs and remove fragments."""
+        if not url:
+            return None
+
+        try:
+            url = urldefrag(url.strip())[0]
+            parsed = urlparse(url)
+
+            if parsed.scheme.lower() not in ("http", "https"):
+                return None
+
+            if not parsed.hostname:
+                return None
+
+            scheme = parsed.scheme.lower()
+            hostname = parsed.hostname.lower()
+
+            # Preserve a non-default port, if present.
+            try:
+                port = parsed.port
+            except ValueError:
+                return None
+
+            if port and not (
+                (scheme == "http" and port == 80)
+                or (scheme == "https" and port == 443)
+            ):
+                netloc = f"{hostname}:{port}"
+            else:
+                netloc = hostname
+
+            path = parsed.path or "/"
+
+            # Keep the root slash, remove other trailing slashes.
+            if path != "/":
+                path = path.rstrip("/") or "/"
+
+            normalized = f"{scheme}://{netloc}{path}"
+
+            # Query parameters may distinguish different pages, so keep them.
+            if parsed.query:
+                normalized += f"?{parsed.query}"
+
+            return normalized
+
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    # ---------------------------------------------------------
+    # DOMAIN RESTRICTION
+    # ---------------------------------------------------------
+
+    def is_allowed_domain(self, url):
+        """Keep the crawl on the configured host."""
+        if not self.allowed_domain:
+            return True
+
+        try:
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            allowed = self.allowed_domain.lower()
+
+            # Accept a hostname or host:port as allowed_domain.
+            if "://" in allowed:
+                allowed = (urlparse(allowed).hostname or "").lower()
+            else:
+                allowed = allowed.split(":", 1)[0]
+
+            return host == allowed
+
+        except (TypeError, ValueError, AttributeError):
+            return False
+
+    # ---------------------------------------------------------
+    # ROBOTS.TXT
+    # ---------------------------------------------------------
+
+    def get_robot_parser(self, url):
+        """Fetch and cache robots.txt for each origin."""
+        try:
+            parsed = urlparse(url)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+        if origin in self.robot_parsers:
+            return self.robot_parsers[origin]
+
+        robots_url = f"{origin}/robots.txt"
+        parser = RobotFileParser()
+        parser.set_url(robots_url)
+
+        try:
+            # Use our configured session/User-Agent to fetch robots.txt.
+            response = self.session.get(robots_url, timeout=10)
+            response.raise_for_status()
+            parser.parse(response.text.splitlines())
+            self.robot_parsers[origin] = parser
+            return parser
+        except requests.RequestException as error:
+            # If robots.txt cannot be retrieved, log the issue and continue
+            # using the crawler's fallback policy. Do not bypass a rule that
+            # was successfully retrieved and parsed.
+            print(f"Could not retrieve robots.txt: {robots_url} ({error})")
+            self.robot_parsers[origin] = None
+            return None
+
+    def allowed_by_robots(self, url):
+        """Return whether the configured crawler identity may fetch a URL."""
+        parser = self.get_robot_parser(url)
+
+        # Retrieval failures are handled as unavailable robots.txt.
+        if parser is None:
+            return True
+
+        try:
+            return parser.can_fetch("SylvaSearchBot", url)
+        except Exception as error:
+            print(f"Could not evaluate robots.txt for {url}: {error}")
+            # Fail closed if a retrieved policy cannot be evaluated.
+            return False
+
+    # ---------------------------------------------------------
+    # LINK EXTRACTION
+    # ---------------------------------------------------------
+
+    def extract_links(self, soup, current_url):
+        """Extract normalized, same-domain HTTP(S) links."""
+        links = set()
+
+        try:
+            anchors = soup.find_all("a", href=True)
+        except Exception:
+            return links
+
+        for anchor in anchors:
+            try:
+                href = (anchor.get("href") or "").strip()
+                if not href:
+                    continue
+
+                lowered_href = href.lower()
+                if lowered_href.startswith(
+                    ("#", "javascript:", "mailto:", "tel:", "data:")
+                ):
+                    continue
+
+                absolute_url = urljoin(current_url, href)
+                normalized_url = self.normalize_url(absolute_url)
+
+                if not normalized_url:
+                    continue
+
+                if not self.is_allowed_domain(normalized_url):
+                    continue
+
+                links.add(normalized_url)
+
+            except Exception:
+                continue
+
+        return links
+
+    # ---------------------------------------------------------
+    # CONTENT EXTRACTION
+    # ---------------------------------------------------------
+
+    def extract_content(self, soup):
+        """Extract unique headings, paragraphs, and list items."""
+        unwanted_tags = [
+            "script",
+            "style",
+            "noscript",
+            "svg",
+            "canvas",
+            "iframe",
+            "form",
+            "nav",
+            "footer",
+            "header",
+            "aside",
+        ]
+
+        for tag_name in unwanted_tags:
+            for tag in list(soup.find_all(tag_name)):
+                try:
+                    tag.decompose()
+                except Exception:
+                    pass
+
+        content_blocks = []
+        tags_to_collect = ["h1", "h2", "h3", "h4", "p", "li"]
+
+        try:
+            elements = soup.find_all(tags_to_collect)
+        except Exception:
+            elements = []
+
+        seen = set()
+
+        for element in elements:
+            try:
+                text = element.get_text(" ", strip=True)
+            except Exception:
+                continue
+
+            text = " ".join(text.split())
+
+            # Skip very short fragments and unusually large blocks.
+            if len(text) < 20 or len(text) > 3000:
+                continue
+
+            normalized = text.casefold()
+            if normalized in seen:
+                continue
+
+            seen.add(normalized)
+            content_blocks.append(text)
+
+        return " ".join(content_blocks).strip()
+
+    # ---------------------------------------------------------
+    # CRAWL
+    # ---------------------------------------------------------
+
+    def crawl(self, start_url):
+        """
+        Crawl a website using breadth-first search.
+
+        Returns a dictionary containing:
+          documents: list of {url, title, text, links}
+          blocked_by_robots: number of URLs denied by robots.txt
+          request_errors: number of page download failures
+        """
+        start_url = self.normalize_url(start_url)
+
+        if not start_url:
+            print("Invalid start URL.")
+            return {
+                "documents": [],
+                "blocked_by_robots": 0,
+                "request_errors": 0,
+            }
+
+        self.queue = deque([(start_url, 0)])
+        self.visited = set()
+
+        documents = []
+        blocked_by_robots = 0
+        request_errors = 0
+
+        while self.queue and len(documents) < self.max_pages:
+            url, depth = self.queue.popleft()
+
+            if url in self.visited:
+                continue
+
+            if not self.is_allowed_domain(url):
+                continue
+
+            if depth > self.max_depth:
+                continue
+
+            # Mark before checking/downloading to avoid repeated attempts.
+            self.visited.add(url)
+
+            if not self.allowed_by_robots(url):
+                print(f"Blocked by robots.txt: {url}")
+                blocked_by_robots += 1
+                continue
+
+            print(f"Crawling: {url}")
+
+            try:
+                response = self.session.get(url, timeout=15)
+                response.raise_for_status()
+            except requests.RequestException as error:
+                print(f"Request failed: {url}")
+                print(error)
+                request_errors += 1
+                continue
+            except Exception as error:
+                print(f"Unexpected request error: {url}")
+                print(error)
+                request_errors += 1
+                continue
+
+            content_type = response.headers.get("Content-Type", "").lower()
+            if "text/html" not in content_type:
+                print(f"Skipping non-HTML: {url}")
+                continue
+
+            try:
+                soup = BeautifulSoup(response.text, "lxml")
+            except Exception:
+                soup = BeautifulSoup(response.text, "html.parser")
+
+            try:
+                title_tag = soup.find("title")
+                title = title_tag.get_text(" ", strip=True) if title_tag else ""
+            except Exception:
+                title = ""
+
+            # Extract links before content cleaning removes navigation.
+            page_links = self.extract_links(soup, url)
+            print(f"Found {len(page_links)} links")
+
+            text = self.extract_content(soup)
+            if not text:
+                print(f"Skipping empty page: {url}")
+                continue
+
+            documents.append(
+                {
+                    "url": url,
+                    "title": title,
+                    "text": text,
+                    "links": sorted(page_links),
+                }
+            )
+
+            if depth < self.max_depth:
+                for link in sorted(page_links):
+                    if link not in self.visited:
+                        self.queue.append((link, depth + 1))
+
+            if self.delay > 0 and self.queue and len(documents) < self.max_pages:
+                time.sleep(self.delay)
+
+        print(
+            "Crawl complete. "
+            f"Pages crawled: {len(documents)}, "
+            f"Blocked by robots: {blocked_by_robots}, "
+            f"Request errors: {request_errors}"
+        )
+
+        return {
+            "documents": documents,
+            "blocked_by_robots": blocked_by_robots,
+            "request_errors": request_errors,
+        }
+
+    def close(self):
+        """Close the underlying HTTP session."""
+        self.session.close()
+
+
+================================================================================
+FILE: D:\SE\sylvasearch\backend\app\crawler\__init__.py
+================================================================================
+
+================================================================================
+FILE: D:\SE\sylvasearch\backend\app\indexer\index.py
+================================================================================
+import re
+from collections import defaultdict
+
+
+class InvertedIndex:
+
+    def __init__(self):
+
+        self.index = defaultdict(set)
+        self.documents = {}
+
+    def tokenize(self, text):
+
+        words = re.findall(
+            r"\b[a-zA-Z0-9]+\b",
+            text.lower()
+        )
+
+        return words
+
+    def add_document(
+        self,
+        document_id,
+        document
+    ):
+
+        self.documents[document_id] = document
+
+        text = (
+            document["title"]
+            + " "
+            + document["text"]
+        )
+
+        words = self.tokenize(text)
+
+        for word in words:
+
+            self.index[word].add(
+                document_id
+            )
+
+    def search(self, query):
+
+        words = self.tokenize(query)
+
+        if not words:
+            return []
+
+        matching_documents = None
+
+        for word in words:
+
+            documents = self.index.get(
+                word,
+                set()
+            )
+
+            if matching_documents is None:
+
+                matching_documents = documents.copy()
+
+            else:
+
+                matching_documents &= documents
+
+        if not matching_documents:
+            return []
+
+        return [
+            self.documents[doc_id]
+            for doc_id in matching_documents
+        ]
+
+================================================================================
+FILE: D:\SE\sylvasearch\backend\app\indexer\__init__.py
+================================================================================
+
+================================================================================
+FILE: D:\SE\sylvasearch\backend\app\search\engine.py
+================================================================================
+
+import math
+import re
+from collections import Counter
+
+
+class SearchEngine:
+    def __init__(self, index, page_ranks=None):
+        self.index = index
+
+        # BM25 parameters
+        self.k1 = 1.5
+        self.b = 0.75
+
+        # PageRank data
+        self.page_ranks = page_ranks or {}
+
+        # Common English stop words
+        self.stop_words = {
+            "a", "an", "the", "is", "are", "was", "were",
+            "of", "to", "in", "on", "for", "and", "or",
+            "with", "by", "from", "as", "at", "be", "this",
+            "that", "it", "its", "into", "about", "over",
+            "under", "after", "before", "than", "then",
+            "also", "can", "could", "would", "should",
+            "will", "just", "not",
+        }
+
+    # ---------------------------------------------------------
+    # TOKENIZATION
+    # ---------------------------------------------------------
+
+    def tokenize(self, text):
+        if not text:
+            return []
+
+        words = re.findall(r"\b[a-zA-Z0-9]+\b", text.lower())
+        return [word for word in words if word not in self.stop_words]
+
+    # ---------------------------------------------------------
+    # IDF
+    # ---------------------------------------------------------
+
+    def calculate_idf(self, word):
+        total_documents = len(self.index.documents)
+
+        if total_documents == 0:
+            return 0.0
+
+        document_frequency = len(self.index.index.get(word, set()))
+
+        if document_frequency == 0:
+            return 0.0
+
+        return math.log(
+            1 + (
+                total_documents - document_frequency + 0.5
+            ) / (
+                document_frequency + 0.5
+            )
+        )
+
+    # ---------------------------------------------------------
+    # AVERAGE DOCUMENT LENGTH
+    # ---------------------------------------------------------
+
+    def calculate_average_length(self):
+        documents = self.index.documents
+
+        if not documents:
+            return 0.0
+
+        total_length = sum(
+            len(self.tokenize(document.get("text", "")))
+            for document in documents.values()
+        )
+
+        return total_length / len(documents)
+
+    # ---------------------------------------------------------
+    # BM25
+    # ---------------------------------------------------------
+
+    def bm25_score(self, document_id, query_words, average_length=None):
+        document = self.index.documents[document_id]
+        words = self.tokenize(document.get("text", ""))
+
+        if not words:
+            return 0.0
+
+        if average_length is None:
+            average_length = self.calculate_average_length()
+
+        if average_length <= 0:
+            return 0.0
+
+        word_counts = Counter(words)
+        document_length = len(words)
+        score = 0.0
+
+        for word in query_words:
+            term_frequency = word_counts[word]
+
+            if term_frequency == 0:
+                continue
+
+            idf = self.calculate_idf(word)
+
+            numerator = term_frequency * (self.k1 + 1)
+
+            denominator = term_frequency + self.k1 * (
+                1 - self.b
+                + self.b * (document_length / average_length)
+            )
+
+            score += idf * numerator / denominator
+
+        return score
+
+    # ---------------------------------------------------------
+    # SCORE TRANSFORMATIONS
+    # ---------------------------------------------------------
+
+    def normalize_bm25(self, score):
+        """
+        Map non-negative BM25 scores to [0, 1].
+        Higher scores approach 1 without depending on
+        the other documents in the current result set.
+        """
+        score = max(0.0, score)
+        return score / (score + 2.0)
+
+    def normalize_pagerank(self, score):
+        """
+        Smoothly scale PageRank values for the combined score.
+        The reference scale is fixed rather than calculated
+        from the current search candidates.
+        """
+        score = max(0.0, score)
+        reference = 0.0001
+        return score / (score + reference)
+
+    # ---------------------------------------------------------
+    # TITLE SCORE
+    # ---------------------------------------------------------
+
+    def title_score(self, document, query_words):
+        title_words = self.tokenize(document.get("title", ""))
+
+        if not title_words or not query_words:
+            return 0.0
+
+        matches = sum(
+            1 for word in query_words if word in title_words
+        )
+
+        return matches / len(query_words)
+
+    # ---------------------------------------------------------
+    # PHRASE SCORE
+    # ---------------------------------------------------------
+
+    def phrase_score(self, document, query):
+        if not query or not query.strip():
+            return 0.0
+
+        def normalize_phrase(text):
+            words = re.findall(r"\b[a-zA-Z0-9]+\b", text.lower())
+            return " ".join(words)
+
+        # Normalize whitespace and case for phrase comparison.
+        normalized_query = normalize_phrase(query)
+
+        if  not normalized_query:
+            return 0.0
+
+        title = normalize_phrase(document.get("title", ""))
+        text = normalize_phrase(document.get("text", ""))
+
+        if f" {normalized_query} " in f" {title} ":
+            return 1.0
+
+        if f" {normalized_query} " in f" {text} ":
+            return 0.7
+
+        return 0.0
+
+    # ---------------------------------------------------------
+    # CANDIDATE RETRIEVAL
+    # ---------------------------------------------------------
+
+    def get_candidate_documents(self, query_words):
+        if not query_words:
+            return set()
+
+        unique_words = list(dict.fromkeys(query_words))
+        matching_documents = None
+
+        # First, find documents containing every query term.
+        for word in unique_words:
+            documents = self.index.index.get(word, set())
+
+            if matching_documents is None:
+                matching_documents = set(documents)
+            else:
+                matching_documents &= documents
+
+        if matching_documents:
+            return matching_documents
+
+        # If AND search finds nothing, use OR search.
+        candidate_documents  = set()
+
+        for word in unique_words:
+            candidate_documents.update(self.index.index.get(word, set()))
+
+        return candidate_documents
+
+    # ---------------------------------------------------------
+    # SNIPPET GENERATION
+    # ---------------------------------------------------------
+
+    def generate_snippet(self, document, query_words):
+        text = document.get("text", "").strip()
+
+        if not text:
+            return ""
+
+        if not query_words:
+            return text[:300]
+
+        lower_text = text.lower()
+        positions = []
+
+        for word in query_words:
+            position = lower_text.find(word)
+
+            if position != -1:
+                positions.append(position)
+
+        if not positions:
+            return text[:300]
+
+        position = min(positions)
+        start = max(0, position - 120)
+        end = min(len(text), position + 220)
+
+        snippet = text[start:end].strip()
+
+        if start > 0:
+            snippet = "..." + snippet
+
+        if end < len(text):
+            snippet += "..."
+
+        return snippet
+
+    # ---------------------------------------------------------
+    # MAIN SEARCH
+    # ---------------------------------------------------------
+
+    def search(self, query):
+        if not query or not query.strip():
+            return []
+
+        query = query.strip()
+        query_words = list(dict.fromkeys(self.tokenize(query)))
+
+        if not query_words:
+            return []
+
+        candidate_documents = self.get_candidate_documents(
+            query_words
+        )
+
+        if not candidate_documents:
+            return []
+
+        # Calculate average length only once per search.
+        average_length = self.calculate_average_length()
+
+        results = []
+
+        for document_id in candidate_documents:
+            document = self.index.documents.get(document_id)
+
+            if document is None:
+                continue
+
+            # Raw relevance signals
+            bm25 = self.bm25_score(
+                document_id,
+                query_words,
+                average_length,
+            )
+
+            title = self.title_score(document, query_words)
+            phrase = self.phrase_score(document, query)
+
+            pagerank = max(
+                0.0,
+                self.page_ranks.get(document.get("url", ""), 0.0),
+            )
+
+            # Fixed transformations: independent of the other
+            # documents returned for this particular query.
+            bm25_normalized = self.normalize_bm25(bm25)
+            pagerank_normalized = self.normalize_pagerank(pagerank)
+
+            # Final ranking weights
+            final_score = (
+                0.55 * bm25_normalized
+                + 0.25 * title
+                + 0.15 * phrase
+                + 0.05 * pagerank_normalized
+            )
+
+            snippet = self.generate_snippet(
+                document,
+                query_words,
+            )
+
+            results.append({
+                "title": document.get("title", ""),
+                "url": document.get("url", ""),
+                "score": round(final_score, 4),
+                "bm25": round(bm25, 4),
+                "bm25_normalized": round(bm25_normalized, 4),
+                "title_score": round(title, 4),
+                "phrase_score": round(phrase, 4),
+                "pagerank": round(pagerank, 6),
+                "pagerank_normalized": round(
+                    pagerank_normalized, 4
+                ),
+                "text": snippet,
+            })
+
+        results.sort(
+            key=lambda result: result["score"],
+            reverse=True,
+        )
+
+        return results
+
+
+================================================================================
+FILE: D:\SE\sylvasearch\backend\app\search\pagerank.py
+================================================================================
+from collections import defaultdict
+
+
+class PageRank:
+
+    def __init__(self, damping=0.85, iterations=20):
+
+        self.damping = damping
+        self.iterations = iterations
+
+    def calculate(self, links):
+
+        if not links:
+            return {}
+
+        # --------------------------------
+        # Build graph
+        # --------------------------------
+
+        graph = defaultdict(set)
+        pages = set()
+
+        for source, target in links:
+
+            graph[source].add(target)
+
+            pages.add(source)
+            pages.add(target)
+
+        total_pages = len(pages)
+
+        if total_pages == 0:
+            return {}
+
+        # --------------------------------
+        # Initial PageRank
+        # --------------------------------
+
+        rank = {
+            page: 1 / total_pages
+            for page in pages
+        }
+
+        # --------------------------------
+        # PageRank iterations
+        # --------------------------------
+
+        for _ in range(self.iterations):
+
+            new_rank = {
+                page: (1 - self.damping) / total_pages
+                for page in pages
+            }
+
+            for page in pages:
+
+                outgoing_links = graph.get(page, set())
+
+                if not outgoing_links:
+                    continue
+
+                contribution = (
+                    self.damping
+                    * rank[page]
+                    / len(outgoing_links)
+                )
+
+                for target in outgoing_links:
+
+                    new_rank[target] += contribution
+
+            rank = new_rank
+
+        return rank
+
+================================================================================
+FILE: D:\SE\sylvasearch\backend\app\search\__init__.py
+================================================================================
